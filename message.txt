@@ -1,0 +1,438 @@
+from gpiozero import Servo
+from gpiozero import Button, OutputDevice
+from time import sleep
+from mfrc522 import SimpleMFRC522 
+import sqlite3
+import smbus
+from escpos.printer import Serial
+import RPi.GPIO as GPIO
+import cv2
+import torch
+GPIO.setwarnings(False)
+from gpiozero.pins.pigpio import PiGPIOFactory
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+import RPi.GPIO as GPIO
+import time
+
+spins1 = 57
+spins2 = 3
+spins3 = 3
+spins4 = 3
+# Instantiate the RFID reader object
+reader = SimpleMFRC522()
+
+# Establish connection to the SQLite database
+conn = sqlite3.connect('/home/christian/Desktop/rfid.db')
+cursor = conn.cursor()
+
+TRIG = 5  # Replace with your TRIG pin number
+ECHO = 0  # Replace with your ECHO pin number
+
+# Define buttons using GPIO pins 26, 19, 13, 6, 16, 20, and 21
+button_1 = Button(26)
+button_2 = Button(19)
+button_3 = Button(13)
+button_4 = Button(6)
+button_5 = Button(16)
+button_6 = Button(20)
+button_7 = Button(21)
+
+# Define relays using GPIO pins 17, 27, 22, and 23
+relay_1 = OutputDevice(17)
+relay_2 = OutputDevice(27)
+relay_3 = OutputDevice(22)
+relay_4 = OutputDevice(23)
+
+# Define servo using GPIO pin 1
+factory = PiGPIOFactory()
+servo = Servo(5, min_pulse_width=0.5/1000, max_pulse_width=2.5/1000, pin_factory=factory)
+
+# Define I2C LCD parameters
+LCD_WIDTH = 16  # Maximum characters per line
+LCD_CHR = 1     # Character mode
+LCD_CMD = 0     # Command mode
+LCD_LINE_1 = 0x80  # LCD RAM address for the 1st line
+LCD_LINE_2 = 0xC0  # LCD RAM address for the 2nd line
+LCD_BACKLIGHT = 0x08  # On
+
+# Define some device parameters
+LCD_ADDRESS = 0x27  # I2C address
+LCD_BUS = 1          # 1 indicates /dev/i2c-1
+LCD = smbus.SMBus(LCD_BUS)  # Create a new I2C bus
+
+# Initialize the printer
+p = Serial(devfile='/dev/serial0', baudrate=9600)
+
+def setup():
+    """Initializes the GPIO settings."""
+    GPIO.setwarnings(False)  # Disable warnings
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(TRIG, GPIO.OUT)
+    GPIO.setup(ECHO, GPIO.IN)
+    GPIO.output(TRIG, False)
+    print("Sensor initialized and settled")
+    
+def measure_distance():
+    """Measures the distance using the ultrasonic sensor."""
+    # Trigger the sensor
+    GPIO.output(TRIG, True)
+    time.sleep(0.00001)  # 10 microseconds
+    GPIO.output(TRIG, False)
+    
+    pulse_start = time.time()
+    pulse_end = pulse_start
+    
+    # Wait for the echo to start
+    while GPIO.input(ECHO) == 0:
+        pulse_start = time.time()
+    
+    # Wait for the echo to stop
+    while GPIO.input(ECHO) == 1:
+        pulse_end = time.time()
+    
+    # Calculate the duration of the pulse
+    pulse_duration = pulse_end - pulse_start
+    
+    # Calculate the distance
+    distance = pulse_duration * 17150  # Speed of sound in cm/s divided by 2 (to and fro)
+    distance = round(distance, 2)
+    
+    return distance
+
+# Functions for LCD control
+def lcd_init():
+    # Initialise display
+    lcd_byte(0x33, LCD_CMD)  # 110011 Initialise
+    lcd_byte(0x32, LCD_CMD)  # 110010 Initialise
+    lcd_byte(0x06, LCD_CMD)  # 000110 Cursor move direction
+    lcd_byte(0x0C, LCD_CMD)  # 001100 Display On,Cursor Off, Blink Off
+    lcd_byte(0x28, LCD_CMD)  # 101000 Data length, number of lines, font size
+    lcd_byte(0x01, LCD_CMD)  # 000001 Clear display
+    sleep(0.0005)             # Delay to allow commands to process
+
+def lcd_byte(bits, mode):
+    # Send byte to data pins
+    bits_high = mode | (bits & 0xF0) | LCD_BACKLIGHT
+    bits_low = mode | ((bits << 4) & 0xF0) | LCD_BACKLIGHT
+
+    # High bits
+    LCD.write_byte(LCD_ADDRESS, bits_high)
+    lcd_toggle_enable(bits_high)
+
+    # Low bits
+    LCD.write_byte(LCD_ADDRESS, bits_low)
+    lcd_toggle_enable(bits_low)
+
+def lcd_toggle_enable(bits):
+    # Toggle enable
+    sleep(0.0005)
+    LCD.write_byte(LCD_ADDRESS, (bits | 0x04))
+    sleep(0.0005)
+    LCD.write_byte(LCD_ADDRESS, (bits & ~0x04))
+    sleep(0.0005)
+
+def lcd_string(message, line):
+    # Send string to display
+    message = message.ljust(LCD_WIDTH, " ")
+    lcd_byte(line, LCD_CMD)
+    for i in range(LCD_WIDTH):
+        lcd_byte(ord(message[i]), LCD_CHR)
+
+def print_info_on_thermal_printer(id, points):
+    # Print shop information
+    p.set(align="center")
+    p.text("Reverse Vending Machine\n")
+    p.text("Card ID: {}\n".format(id))
+    p.text("Points written: {}\n".format(points))
+      
+    # Print QR code
+    p.qr("Reverse Vending Machine", native=True, size=12)
+    p.text("\n")
+    
+    # Print barcode with card ID (converted to string)
+    p.barcode(str(id), 'CODE39')
+    p.text("\n")
+    p.cut()  # Cut the paper after printing
+    
+    print("Points printed to thermal printer.")
+points = 0  # Define points variable outside of functions
+
+def read_rfid():
+    global points  # Use the global points variable
+    lcd_init()
+    
+    lcd_string("Place your RFID", LCD_LINE_1)
+    lcd_string("card", LCD_LINE_2)
+    print("Place your card to read")
+    card_id_tuple = reader.read()
+    card_id = card_id_tuple[0]  # Extract the card ID from the tuple
+    print("Card ID:", card_id)
+
+    # Check if the card is already registered
+    cursor.execute("SELECT points FROM cards WHERE card_id=?", (card_id,))
+    result = cursor.fetchone()
+
+    if result is not None:
+        # Card is already registered, retrieve points from the database
+        points = result[0]
+        lcd_init()
+        lcd_string(f"Card ID: {card_id}", LCD_LINE_1)
+        lcd_string(f"Points: {points}", LCD_LINE_2)
+        print("Points stored on card:", points)
+    else:
+        # Card is new, assign 0 points
+        points = 0
+        cursor.execute("INSERT INTO cards (card_id, points) VALUES (?, ?)", (card_id, points))
+        conn.commit()
+        lcd_init()
+        lcd_string(f"New Card ID: {card_id}", LCD_LINE_1)
+        lcd_string(f"Points: {points}", LCD_LINE_2)
+        
+
+    return card_id, points
+
+
+# Read RFID card once
+card_id, points = read_rfid()
+
+
+
+# Initialize counts dictionary
+class_names = ["190ml", "290ml", "250ml", "350ml", "500ml", "750ml", "1000ml", "reject"]
+counts = {class_name: 0 for class_name in class_names}
+
+# Define points for each class
+class_points = {"190ml": 0.45, "290ml": 0.45, "250ml": 0.45, "350ml": 0.45, 
+                "500ml": 0.45, "750ml": 0.45, "1000ml": 0.45, "reject": 0}
+
+total_points = 0
+
+def send_email(subject, body, to_email):
+    # Set up your Gmail credentials
+    sender_email = "chrischegg555@gmail.com"
+    sender_password = "swglvakcobyhbtyq"
+    to_email = "xctianx@gmail.com"
+
+    # Create the MIME object
+    message = MIMEMultipart()
+    message["From"] = sender_email
+    message["To"] = to_email
+    message["Subject"] = subject
+
+    # Attach the body of the email
+    message.attach(MIMEText(body, "plain"))
+
+    try:
+        # Connect to Gmail's SMTP server
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, to_email, message.as_string())
+        print("Email sent successfully!")
+
+    except Exception as e:
+        print(f"Error: {e}")
+
+
+def capture_and_save_image():
+    cap = cv2.VideoCapture(0)
+    ret, frame = cap.read()
+    cap.release()
+    cv2.imwrite('/usr/local/lib/python3.11/dist-packages/yolov5/photos/captured_image.jpg', frame)
+    print("Image saved as captured_image.jpg")
+
+# Function to analyze image using YOLOv5
+def analyze_image():
+    # Loading in yolov5s
+    model = torch.hub.load('ultralytics/yolov5', 'custom', path='/usr/local/lib/python3.11/dist-packages/yolov5/best.pt')
+    img = '/usr/local/lib/python3.11/dist-packages/yolov5/photos/captured_image.jpg'
+    results = model(img)
+
+    # Convert results to DataFrame
+    df_results = results.pandas().xyxy[0]
+
+    # Update counts for each class
+    for class_name in class_names:
+        count = df_results[df_results['name'] == class_name].shape[0]
+        counts[class_name] += count
+
+    return df_results
+
+# Calculate total points
+def calculate_points():
+    total_points = sum(counts[class_name] * class_points[class_name] for class_name in class_names)
+    return total_points
+
+def servo_analyze_image(df_results):
+    if "reject" in df_results['name'].values:
+        print("Reject detected")
+        servo.min()
+        sleep(1)
+        servo.mid()  # Move servo to minimum position
+    else:
+        # Check if any other specified size is detected
+        for class_name in class_names[:-1]:  # Exclude "reject" class
+            if class_name in df_results['name'].values:
+                print(f"{class_name} detected")
+                servo.max()
+                sleep(1)
+                servo.mid()  # Move servo to maximum position
+                
+def open_connection():
+    # Establish connection to the SQLite database
+    conn = sqlite3.connect('/home/christian/Desktop/rfid.db')
+    cursor = conn.cursor()
+    return conn, cursor
+
+def add_points(card_id, session_points):
+    try:
+        # Try to insert the points for the card_id
+        cursor.execute("INSERT INTO cards (card_id, points) VALUES (?, ?)", (card_id, session_points))
+        conn.commit()
+        print("Points added successfully for card_id:", card_id)
+    except sqlite3.IntegrityError:
+        # If card_id already exists, update the points by adding new points to existing ones
+        cursor.execute("SELECT points FROM cards WHERE card_id=?", (card_id,))
+        existing_points = cursor.fetchone()[0]
+        total_points = existing_points + session_points
+        cursor.execute("UPDATE cards SET points=? WHERE card_id=?", (total_points, card_id))
+        conn.commit()
+        print("Points updated successfully for card_id:", card_id)
+    
+    # Debug: Print the contents of the cards table
+    cursor.execute("SELECT * FROM cards")
+    print("Current contents of the cards table:")
+    for row in cursor.fetchall():
+        print(row)
+
+
+
+while True:
+    if button_1.is_pressed:
+        print('Button 1 pushed')
+        if points > 0:
+            if spins1 > 0:
+                relay_1.on()
+                sleep(22)  # Turn on relay connected to GPIO pin 17
+                relay_1.off()  # Turn off relay connected to GPIO pin 17
+                spins1 -= 1  # Decrement spins by 1
+                points -= 2
+                lcd_init()
+                lcd_string(f"Points: {points}", LCD_LINE_1)
+                cursor.execute("UPDATE cards SET points=? WHERE card_id=?", (points, card_id))
+                conn.commit()
+                if spins1 == 0:
+                    send_email("Hello from Reverse Vending Machine", "Your water container is now out of stock please refill", "recipient.email@example.com")  # If spins reach 0, send email
+                    spins1 = 5  # Reset spins to 5 again
+        else:
+            print("No points left on card")
+
+    if button_2.is_pressed:
+        print('Button 2 pushed')
+        if points > 0: 
+            if spins2 > 0:
+                relay_3.on()
+                sleep(1)  # Turn on relay connected to GPIO pin 17
+                relay_3.off()  # Turn off relay connected to GPIO pin 17
+                spins2 -= 1  # Decrement spins by 1
+                points -= 2
+                lcd_init()
+                lcd_string(f"Points: {points}", LCD_LINE_1)
+                cursor.execute("UPDATE cards SET points=? WHERE card_id=?", (points, card_id))
+                conn.commit()
+                if spins2 == 0:
+                    send_email("Hello from Reverse Vending Machine", "Your spring 1 is now out of stock please refill", "recipient.email@example.com")  # If spins reach 0, send email
+                    spins2 = 5  # Reset spins to 5 again
+        else:
+            print("No points left on card")
+
+    if button_3.is_pressed:
+        print('Button 3 pushed')
+        if points > 0:
+            if spins3 > 0:
+                relay_4.on()
+                sleep(1)  # Turn on relay connected to GPIO pin 17
+                relay_4.off()  # Turn off relay connected to GPIO pin 17
+                spins3 -= 1  # Decrement spins by 1
+                points -= 2
+                lcd_init()
+                lcd_string(f"Points: {points}", LCD_LINE_1)
+                cursor.execute("UPDATE cards SET points=? WHERE card_id=?", (points, card_id))
+                conn.commit()
+                if spins3 == 0:
+                    send_email("Hello from Reverse Vending Machine", "Your spring 2 is now out of stock please refill", "recipient.email@example.com")  # If spins reach 0, send email
+                    spins3 = 5  # Reset spins to 5 again
+        else:
+            print("No points left on card")
+
+      # Initialize spins to 5
+
+    if button_4.is_pressed:
+        print('Button 4 pushed')
+        if points > 0:
+            if spins4 > 0:
+                relay_2.on()
+                sleep(1)  # Turn on relay connected to GPIO pin 17
+                relay_2.off()  # Turn off relay connected to GPIO pin 17
+                spins4 -= 1  # Decrement spins by 1
+                points -= 2
+                lcd_init()
+                lcd_string(f"Points: {points}", LCD_LINE_1)
+                cursor.execute("UPDATE cards SET points=? WHERE card_id=?", (points, card_id))
+                conn.commit()
+                if spins4 == 0:
+                    send_email("Hello from Reverse Vending Machine", "Your spring 3 is now out of stock please refill", "recipient.email@example.com")  # If spins reach 0, send email
+                    spins4 = 5  # Reset spins to 5 again
+        else:
+            print("No points left on card")
+
+
+    if button_5.is_pressed:
+        print('Button 5 pushed')
+        read_rfid()
+        card_id, points = read_rfid()  # Read RFID card again after logout
+        # Print points to thermal printer
+        print_info_on_thermal_printer(card_id, points)
+
+    if button_6.is_pressed:
+        print('Button 6 pushed')
+        capture_and_save_image()
+        df_results = analyze_image()  # all analyze_image() and store the result in df_results
+        print('this is the name: ' + df_results['name'])
+        servo_analyze_image(df_results)  # Pass df_results to servo_analyze_image()
+        print("Counts:", counts)
+        print("Total points:", calculate_points())
+        setup()
+    
+        try:
+            while True:
+                distance = measure_distance()
+                print(f"Distance: {distance} cm")
+                
+                # Check the distance and perform an action if it meets the condition
+                if distance == 0.01:
+                    send_email("Hello from Reverse Vending Machine", "Your Shredded Plastic Box is Full", "recipient.email@example.com")
+                else:
+                    print("Not Full")
+                
+                time.sleep(1)  # 1 second delay between measurements
+
+    except KeyboardInterrupt:
+        print("Measurement stopped by User")
+        GPIO.cleanup()
+
+    if button_7.is_pressed:
+        print('Button 7 pushed')
+        session_points = calculate_points()  # Calculate points collected in the current session
+        total_points += session_points  # Accumulate total points (if needed)
+        print("Total points collected:", total_points)
+        add_points(card_id, session_points)  # Add points collected in the session to the database
+        
+        # Reset counts
+        counts = {class_name: 0 for class_name in class_names}
+        read_rfid()
+        
+    
+     
+    sleep(0.1)  # Adjust sleep time as neede
